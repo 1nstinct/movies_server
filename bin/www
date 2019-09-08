@@ -1,0 +1,188 @@
+#!/usr/bin/env node
+
+/**
+ * Module dependencies.
+ */
+
+var app = require('../app');
+var debug = require('debug')('veerum-server:server');
+var http = require('http');
+const csv = require('csv-parser');
+const fs = require('fs');
+const request = require('request'); // Imports the module for use
+const { parse } = require('json2csv');
+const cron = require('node-cron');
+
+require('dotenv').config();
+
+const API_KEY = process.env.API_KEY;
+/**
+ * Get port from environment and store in Express.
+ */
+
+var port = normalizePort(process.env.PORT || '3001');
+app.set('port', port);
+
+/**
+ * Create HTTP server.
+ */
+
+var server = http.createServer(app);
+
+/**
+ * Listen on provided port, on all network interfaces.
+ */
+
+server.listen(port);
+server.on('error', onError);
+server.on('listening', onListening);
+
+// CSV processing
+const dataArray = []; // store csv file as array
+let i = 0;
+const perIteration = 5; // number of processed rows per one cron job run
+const CSV_FILE_NAME = process.env.CSV_FILE_NAME;
+let maxRowCount = 0;
+
+cron.schedule('*/5 * * * * *', () => {
+  if (i * perIteration > maxRowCount) return;
+  const tmpDataArray = [];
+  let processed = 0;
+
+  // the main decoding function
+  const decoder = () => {
+    let rejectedErr = '';
+    const from = i * perIteration;
+    const to = (i + 1) * perIteration;
+    console.log(from, to);
+    i++; // next iteration move to the another bunch of rows
+    return Promise.all(dataArray.slice(from, to).map((row, index) => {
+      row.originIndex = from + index;
+      // check whether the line has lat,lng fields
+      if ((row.lat && row.lng) || rejectedErr) {
+        tmpDataArray.push(row);
+        return Promise.resolve(); // promise resolve
+      }
+      // Geocode an address.
+      return new Promise((resolve, reject) => {
+        const address = encodeURI(`${row.Locations}, San Francisco`); // adding city name to make geocoding preciser
+        const targetUrl = `https://maps.googleapis.com/maps/api/geocode/json?address=${address}&key=${API_KEY}`;
+// request call with parameters
+        return request(targetUrl, function (err, response, body) {
+          if (err || JSON.parse(body).error_message) {
+            rejectedErr = `Geocoding rejected due to the error: ${(err || {}).message || JSON.parse(body).error_message}`;
+            return resolve({});
+          }
+          const geoLocation = JSON.parse(body);
+          if (!geoLocation.results[0]) {
+            return resolve({}); // in case of status = ZERO_RESUULT
+          }
+          processed += 1;
+          return resolve({
+            lat: geoLocation.results[0].geometry.location.lat,
+            lng: geoLocation.results[0].geometry.location.lng
+          });
+        });
+      }).then((latLng) => {
+        tmpDataArray.push({
+          ...row,
+          ...latLng,
+        });
+        return Promise.resolve();
+      });
+    }))
+      .then(() => {
+        // merge original array with result tmp array
+        tmpDataArray.map((resultRow) => {
+          const index = resultRow.originIndex; // restore index
+          delete resultRow.originIndex; // delete tmp field
+          dataArray[index] = resultRow;
+        });
+        // rewrite original files with new data
+        const result = parse(dataArray, { fields: Object.keys(dataArray[0]) });
+        fs.writeFileSync(CSV_FILE_NAME, result);
+        if (rejectedErr) {
+          console.log(`Script processed ${processed} rows with the error: ${rejectedErr}`);
+        } else {
+          console.log(`Script processed ${processed} rows`);
+        }
+      })
+      .catch((err) => {
+        console.error(`Error occurred while processing csv ${err.message}`);
+      });
+  };
+
+  if (dataArray.length) {
+    return decoder();
+  }
+  // read csv file, decode address, save it back to the file
+  return fs.createReadStream(CSV_FILE_NAME)
+    .pipe(csv())
+    .on('data', (row) => {
+      dataArray.push(row); // fill in data array
+    })
+    .on('end', () => {
+      maxRowCount = dataArray.length;
+      decoder();
+    });
+});
+
+/**
+ * Normalize a port into a number, string, or false.
+ */
+
+function normalizePort(val) {
+  var port = parseInt(val, 10);
+
+  if (isNaN(port)) {
+    // named pipe
+    return val;
+  }
+
+  if (port >= 0) {
+    // port number
+    return port;
+  }
+
+  return false;
+}
+
+/**
+ * Event listener for HTTP server "error" event.
+ */
+
+function onError(error) {
+  if (error.syscall !== 'listen') {
+    throw error;
+  }
+
+  var bind = typeof port === 'string'
+    ? 'Pipe ' + port
+    : 'Port ' + port;
+
+  // handle specific listen errors with friendly messages
+  switch (error.code) {
+    case 'EACCES':
+      console.error(bind + ' requires elevated privileges');
+      process.exit(1);
+      break;
+    case 'EADDRINUSE':
+      console.error(bind + ' is already in use');
+      process.exit(1);
+      break;
+    default:
+      throw error;
+  }
+}
+
+/**
+ * Event listener for HTTP server "listening" event.
+ */
+
+function onListening() {
+  var addr = server.address();
+  var bind = typeof addr === 'string'
+    ? 'pipe ' + addr
+    : 'port ' + addr.port;
+  debug('Listening on ' + bind);
+}
